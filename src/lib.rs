@@ -30,3 +30,5 @@ fn unwrap_unreachable<T, E>(value: Result<T, E>) -> T {
     let Ok(inner) = value else { unreachable!() };
     inner // avoids invoking expensive Debug code
 }
+
+pub extern crate ed25519_dalek;
