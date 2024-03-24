@@ -1,7 +1,7 @@
 use crate::channel::{Channel, Pipe};
 use crate::codec::{ObjectHasher, ObjectWriter};
 use crate::error::{Error, ProtocolError};
-use crate::types::{self, Behavior, Request, SecretKey, TransportError};
+use crate::types::{self, AuthMethod, Behavior, Request, SecretKey, TransportError};
 use crate::wire::{self, NameList};
 
 use aes::cipher::{KeyIvInit, StreamCipher};
@@ -9,7 +9,7 @@ use aes::Aes128Enc;
 use constant_time_eq::constant_time_eq;
 use core::ops::Range;
 use ctr::Ctr128BE;
-use ed25519_dalek::{Signature, Signer, Verifier};
+use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use embedded_io_async::{Read, Write};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
@@ -115,6 +115,7 @@ pub struct Transport<'a, T: Behavior> {
     authenticated: bool,
 
     request: Option<Request<T::Command>>,
+    current_user: Option<T::User>,
 
     channels: [Option<PendingChannel>; 4],
     active_channel: Option<ChannelState>,
@@ -142,6 +143,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
             authenticated: false,
 
             request: None,
+            current_user: None,
 
             channels: [None; 4],
             active_channel: None,
@@ -211,6 +213,10 @@ impl<'a, T: Behavior> Transport<'a, T> {
 
     pub(crate) fn channel_request(&self) -> Request<T::Command> {
         self.request.clone().expect("channel was not active")
+    }
+
+    pub(crate) fn channel_user(&self) -> T::User {
+        self.current_user.clone().expect("no current user")
     }
 
     pub(crate) fn channel_data_payload_buffer(&mut self, pipe: Pipe) -> &mut [u8] {
@@ -707,34 +713,70 @@ impl<'a, T: Behavior> Transport<'a, T> {
                 service_name: "ssh-connection",
                 auth_method,
             } if self.userauth_enabled => {
-                match auth_method {
-                    wire::AuthMethod::None => {
-                        self.send(wire::Message::UserAuthFailure {
-                            authentications_that_can_continue: wire::NameList::new_from_string(
-                                "publickey",
-                            )?,
-                            partial_success: false,
-                        })
-                        .await?;
-                    }
+                // Unfortunately we need to use the user name for signature verification, meaning we need
+                // to store it outside the packet buffer. Rather than burden the crate user, we just copy
+                // the user name into a temporary string, enforcing a reasonable 80-byte maximum length.
+
+                let mut user_name_buffer = [0u8; 80];
+
+                if user_name.len() > user_name_buffer.len() {
+                    self.send(wire::Message::UserAuthFailure {
+                        authentications_that_can_continue: wire::NameList::new_from_string(
+                            "publickey",
+                        )?,
+                        partial_success: false,
+                    })
+                    .await?;
+
+                    return Ok(None);
+                }
+
+                let user_name_slice = &mut user_name_buffer[..user_name.len()];
+                user_name_slice.copy_from_slice(user_name.as_bytes());
+
+                let Some(user_auth_method) = (match auth_method {
+                    wire::AuthMethod::None => Some(AuthMethod::None),
                     wire::AuthMethod::PublicKey {
-                        public_key_algorithm_name,
-                        public_key: given_public_key,
-                        signature,
+                        public_key_algorithm_name: "ssh-ed25519",
+                        public_key: wire::PublicKey::Ed25519 { public_key },
+                        signature: Some(wire::Signature::Ed25519 { .. }) | None,
                     } => {
-                        match (
-                            public_key_algorithm_name,
-                            self.behavior.user_public_key(),
-                            signature,
-                        ) {
-                            (
-                                "ssh-ed25519",
-                                types::PublicKey::Ed25519 { public_key },
-                                Some(wire::Signature::Ed25519 { signature }),
-                            ) if user_name == self.behavior.user_name()
-                                && given_public_key == self.behavior.user_public_key().into() =>
+                        if let Ok(public_key) = VerifyingKey::from_bytes(public_key) {
+                            Some(AuthMethod::PublicKey(types::PublicKey::Ed25519 {
+                                public_key,
+                            }))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }) else {
+                    self.send(wire::Message::UserAuthFailure {
+                        authentications_that_can_continue: wire::NameList::new_from_string(
+                            "publickey",
+                        )?,
+                        partial_success: false,
+                    })
+                    .await?;
+
+                    return Ok(None);
+                };
+
+                if let Some(user) = self.behavior.allow_user(user_name, &user_auth_method) {
+                    match user_auth_method {
+                        AuthMethod::None => {
+                            self.send(wire::Message::UserAuthSuccess).await?;
+                            self.current_user = Some(user);
+                            self.authenticated = true;
+                        }
+                        AuthMethod::PublicKey(types::PublicKey::Ed25519 { public_key }) => {
+                            if let wire::AuthMethod::PublicKey {
+                                public_key_algorithm_name: "ssh-ed25519",
+                                public_key: wire::PublicKey::Ed25519 { .. },
+                                signature: Some(wire::Signature::Ed25519 { signature }),
+                            } = auth_method
                             {
-                                let given_public_key = wire::PublicKey::Ed25519 {
+                                let signed_public_key = wire::PublicKey::Ed25519 {
                                     public_key: public_key.as_bytes(),
                                 };
 
@@ -747,16 +789,17 @@ impl<'a, T: Behavior> Transport<'a, T> {
                                 writer
                                     .write_string(&self.curr_keys.as_ref().unwrap().session_id)?;
                                 writer.write_byte(wire::MSG_USERAUTH_REQUEST)?;
-                                writer.write_string_utf8(self.behavior.user_name())?;
+                                writer.write_string(user_name_slice)?;
                                 writer.write_string_utf8("ssh-connection")?;
                                 writer.write_string_utf8("publickey")?;
                                 writer.write_boolean(true)?;
                                 writer.write_string_utf8("ssh-ed25519")?;
-                                given_public_key.encode_with(&mut writer)?;
+                                signed_public_key.encode_with(&mut writer)?;
 
                                 if let Ok(()) = public_key.verify(writer.into_written(), &signature)
                                 {
                                     self.send(wire::Message::UserAuthSuccess).await?;
+                                    self.current_user = Some(user);
                                     self.authenticated = true;
                                 } else {
                                     self.send(wire::Message::UserAuthFailure {
@@ -766,37 +809,25 @@ impl<'a, T: Behavior> Transport<'a, T> {
                                     })
                                     .await?;
                                 }
-                            }
-
-                            ("ssh-ed25519", types::PublicKey::Ed25519 { public_key }, None) => {
+                            } else {
                                 self.send(wire::Message::UserAuthPkOk {
                                     public_key_algorithm_name: "ssh-ed25519",
                                     public_key: wire::PublicKey::Ed25519 {
-                                        public_key: &public_key.to_bytes(),
+                                        public_key: public_key.as_bytes(),
                                     },
-                                })
-                                .await?;
-                            }
-
-                            _ => {
-                                self.send(wire::Message::UserAuthFailure {
-                                    authentications_that_can_continue:
-                                        wire::NameList::new_from_string("publickey")?,
-                                    partial_success: false,
                                 })
                                 .await?;
                             }
                         }
                     }
-                    wire::AuthMethod::Unsupported { .. } => {
-                        self.send(wire::Message::UserAuthFailure {
-                            authentications_that_can_continue: wire::NameList::new_from_string(
-                                "publickey",
-                            )?,
-                            partial_success: false,
-                        })
-                        .await?;
-                    }
+                } else {
+                    self.send(wire::Message::UserAuthFailure {
+                        authentications_that_can_continue: wire::NameList::new_from_string(
+                            "publickey",
+                        )?,
+                        partial_success: false,
+                    })
+                    .await?;
                 }
 
                 return Ok(None);

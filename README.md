@@ -22,9 +22,8 @@ This library is still in early development. Features may be added and the API ma
 | Encryption        | :heavy_check_mark:    | `aes128-ctr`                          |
 | Integrity         | :heavy_check_mark:    | `hmac-256`                            |
 | Compression       | :x:                   | `none`                                |
-| Authentication    | :heavy_check_mark:    | Currently single-user.                |
+| Authentication    | :heavy_check_mark:    | `none`, `publickey`                   |
 | Public-Key Auth   | :heavy_check_mark:    | `ssh-ed25519`                         |
-| Password Auth     | :x:                   | Could be added later.                 |
 | Client Env-vars   | :x:                   | Currently ignored.                    |
 | Exec Requests     | :heavy_check_mark:    | You must parse the command.           |
 | Shell Requests    | :heavy_check_mark:    | You must implement the shell.         |
@@ -38,7 +37,7 @@ The goal of the library is to achieve SSH connectivity with a minimally low memo
 
 ## Usage
 
-The example in `examples/demo.rs` will set up a local SSH server running on localhost on port 2222. You can connect to it using the `zssh` username with the private key in `examples/zssh.priv` as an SSH identity. The example supports three commands, demonstrating different aspects of the API:
+The example in `examples/demo.rs` will set up a local SSH server running on localhost on port 2222. You can connect to it using either the `zssh` username (with the private key in `examples/zssh.priv` as an SSH identity) or the `guest` username (with no authentication). The example supports three commands, demonstrating different aspects of the API:
 
  1. `sha256sum` computes the SHA-256 digest of stdin and returns it on stdout;
  2. `echo` sends stdin back to stdout unchanged;

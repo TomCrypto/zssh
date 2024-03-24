@@ -27,6 +27,13 @@ impl<'a> From<&'a PublicKey> for wire::PublicKey<'a> {
     }
 }
 
+/// Authentication method that a user may choose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthMethod {
+    None,
+    PublicKey(PublicKey),
+}
+
 /// Request associated with an SSH channel.
 #[derive(Clone, Copy, Debug)]
 pub enum Request<T> {
@@ -51,25 +58,23 @@ pub trait Behavior {
     /// The secret key advertised by the server.
     fn host_secret_key(&self) -> &SecretKey;
 
-    /// The allowed public key for the allowed user.
-    ///
-    /// During user authentication, the client must prove possession of the secret key
-    /// associated with the public key returned in here for authentication to succeed.
-    fn user_public_key(&self) -> &PublicKey;
-
-    /// The allowed user name for authentication.
-    ///
-    /// All attempts to authenticate with any user name other than the one returned by
-    /// this method will be accepted but will fail, to avoid disclosing the user name.
-    fn user_name(&self) -> &'static str;
-
     /// The server's identification string.
     ///
     /// This will be sent to the client during the initial version handshake. It must
     /// comply with RFC4253 section 4.2 except it should not contain the final CR LF.
     fn server_id(&self) -> &'static str {
-        "SSH-2.0-zssh_0.1.1"
+        "SSH-2.0-zssh_0.2.0"
     }
+
+    /// Allow a given user to authenticate with a given auth method.
+    ///
+    /// Returns None if the user's auth method is not acceptable (e.g. public key does
+    /// not match a whitelist), otherwise returns a type representing a user identity.
+    ///
+    /// This may be called more than once if the client uses probe requests.
+    fn allow_user(&mut self, username: &str, auth_method: &AuthMethod) -> Option<Self::User>;
+
+    type User: Clone;
 
     /// Whether to allow shell channel requests.
     ///

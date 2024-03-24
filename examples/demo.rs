@@ -2,7 +2,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::{rngs::ThreadRng, thread_rng};
 use sha2::{Digest, Sha256};
 
-use zssh::{Behavior, PublicKey, Request, SecretKey, Transport, TransportError};
+use zssh::{AuthMethod, Behavior, PublicKey, Request, SecretKey, Transport, TransportError};
 
 struct ExampleBehavior {
     stream: AsyncTcpStream,
@@ -37,12 +37,16 @@ impl Behavior for ExampleBehavior {
         &self.host_secret_key
     }
 
-    fn user_public_key(&self) -> &PublicKey {
-        &self.user_public_key
-    }
+    type User = String;
 
-    fn user_name(&self) -> &'static str {
-        "zssh"
+    fn allow_user(&mut self, username: &str, auth_method: &AuthMethod) -> Option<Self::User> {
+        match (username, auth_method) {
+            ("zssh", AuthMethod::PublicKey(public_key)) if *public_key == self.user_public_key => {
+                Some("zssh".to_owned())
+            }
+            ("guest", AuthMethod::None) => Some("guest".to_owned()),
+            _ => None,
+        }
     }
 
     type Command = ExampleCommand;
@@ -92,8 +96,9 @@ async fn handle_client(stream: TcpStream) -> Result<(), TransportError<ExampleBe
         let mut channel = transport.accept().await?;
 
         println!(
-            "Request {:?} from client {}",
+            "Request {:?} by user {:?} from client {:?}",
             channel.request(),
+            channel.user(),
             channel.client_ssh_id_string()
         );
 
@@ -204,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, _) = listener.accept().await?;
 
         if let Err(error) = handle_client(stream).await {
-            println!("SSH transport error: {:?}", error);
+            println!("Transport error: {:?}", error);
         }
     }
 }

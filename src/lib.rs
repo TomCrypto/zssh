@@ -23,7 +23,7 @@ mod wire;
 pub use channel::{Channel, Pipe, Reader, Writer};
 pub use error::{Error, ProtocolError};
 pub use transport::Transport;
-pub use types::{Behavior, PublicKey, Request, SecretKey, TransportError};
+pub use types::{AuthMethod, Behavior, PublicKey, Request, SecretKey, TransportError};
 pub use wire::DisconnectReason;
 
 fn unwrap_unreachable<T, E>(value: Result<T, E>) -> T {

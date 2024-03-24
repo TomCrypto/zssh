@@ -24,6 +24,11 @@ impl<'a, 'b, T: Behavior> Channel<'a, 'b, T> {
         self.transport.channel_request()
     }
 
+    /// Returns the user associated with this channel.
+    pub fn user(&self) -> T::User {
+        self.transport.channel_user()
+    }
+
     /// Returns the identification string of the client.
     pub fn client_ssh_id_string(&self) -> &str {
         self.transport.client_ssh_id_string()
