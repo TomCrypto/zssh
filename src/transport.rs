@@ -151,9 +151,9 @@ impl<'a, T: Behavior> Transport<'a, T> {
     }
 
     pub(crate) fn client_ssh_id_string(&self) -> &str {
-        crate::unwrap_unreachable(core::str::from_utf8(
-            &self.client_ssh_id_buffer[..self.client_ssh_id_length],
-        ))
+        let slice = &self.client_ssh_id_buffer[..self.client_ssh_id_length];
+
+        crate::unwrap_unreachable(core::str::from_utf8(slice).ok())
     }
 
     async fn perform_handshake(&mut self) -> Result<(), TransportError<T>> {
@@ -212,11 +212,11 @@ impl<'a, T: Behavior> Transport<'a, T> {
     }
 
     pub(crate) fn channel_request(&self) -> Request<T::Command> {
-        self.request.clone().expect("channel was not active")
+        crate::unwrap_unreachable(self.request.clone())
     }
 
     pub(crate) fn channel_user(&self) -> T::User {
-        self.current_user.clone().expect("no current user")
+        crate::unwrap_unreachable(self.current_user.clone())
     }
 
     pub(crate) fn channel_data_payload_buffer(&mut self, pipe: Pipe) -> &mut [u8] {
@@ -329,7 +329,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
     }
 
     fn channel_state(&mut self) -> &mut ChannelState {
-        self.active_channel.as_mut().expect("channel not active")
+        crate::unwrap_unreachable(self.active_channel.as_mut())
     }
 
     pub(crate) async fn channel_exit(&mut self, exit_status: u32) -> Result<(), TransportError<T>> {
@@ -786,8 +786,9 @@ impl<'a, T: Behavior> Transport<'a, T> {
 
                                 // TODO: feels like we could do a little better here
 
-                                writer
-                                    .write_string(&self.curr_keys.as_ref().unwrap().session_id)?;
+                                writer.write_string(
+                                    &crate::unwrap_unreachable(self.curr_keys.as_ref()).session_id,
+                                )?;
                                 writer.write_byte(wire::MSG_USERAUTH_REQUEST)?;
                                 writer.write_string(user_name_slice)?;
                                 writer.write_string_utf8("ssh-connection")?;

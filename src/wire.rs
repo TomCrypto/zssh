@@ -652,25 +652,42 @@ impl ChannelOpenFailureReason {
 /// Set of possible disconnection reasons.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisconnectReason {
+    /// Standard RFC4253 disconnect reason.
     HostNotAllowedToConnect,
+    /// Standard RFC4253 disconnect reason.
     ProtocolError,
+    /// Standard RFC4253 disconnect reason.
     KeyExchangeFailed,
+    /// Standard RFC4253 disconnect reason.
     Reserved,
+    /// Standard RFC4253 disconnect reason.
     MacError,
+    /// Standard RFC4253 disconnect reason.
     CompressionError,
+    /// Standard RFC4253 disconnect reason.
     ServiceNotAvailable,
+    /// Standard RFC4253 disconnect reason.
     ProtocolVersionNotSupported,
+    /// Standard RFC4253 disconnect reason.
     HostKeyNotVerifiable,
+    /// Standard RFC4253 disconnect reason.
     ConnectionLost,
+    /// Standard RFC4253 disconnect reason.
     ByApplication,
+    /// Standard RFC4253 disconnect reason.
     TooManyConnections,
+    /// Standard RFC4253 disconnect reason.
     AuthCancelledByUser,
+    /// Standard RFC4253 disconnect reason.
     NoMoreAuthMethodsAvailable,
+    /// Standard RFC4253 disconnect reason.
     IllegalUserName,
+    /// Some other disconnect reason.
     Other(u32),
 }
 
 impl DisconnectReason {
+    /// Decodes an instance of this type from an object reader.
     pub fn decode_with(reader: &mut ObjectReader) -> Result<Self, ProtocolError> {
         let reason_code = reader.read_uint32()?;
         let _description = reader.read_string_utf8()?;
@@ -679,6 +696,7 @@ impl DisconnectReason {
         Ok(Self::from_reason_code(reason_code))
     }
 
+    /// Encodes this instance into an object writer.
     pub fn encode_with(self, writer: &mut ObjectWriter) -> Result<(), ProtocolError> {
         writer.write_uint32(self.into_reason_code())?;
         writer.write_string_utf8(self.description())?;
@@ -687,6 +705,7 @@ impl DisconnectReason {
         Ok(())
     }
 
+    /// Retrieves the underlying reason code.
     pub fn into_reason_code(self) -> u32 {
         match self {
             Self::HostNotAllowedToConnect => 1,
@@ -708,6 +727,7 @@ impl DisconnectReason {
         }
     }
 
+    /// Constructs an instance of this type from a reason code.
     pub fn from_reason_code(reason_code: u32) -> Self {
         match reason_code {
             1 => Self::HostNotAllowedToConnect,
@@ -729,6 +749,7 @@ impl DisconnectReason {
         }
     }
 
+    /// Retrieves a description message for this disconnect reason instance.
     pub fn description(self) -> &'static str {
         match self {
             Self::HostNotAllowedToConnect => "Host not allowed to connect",

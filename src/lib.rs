@@ -12,6 +12,7 @@
 
 #![no_std]
 #![forbid(unsafe_code)]
+#![forbid(missing_docs)]
 
 mod channel;
 mod codec;
@@ -26,9 +27,8 @@ pub use transport::Transport;
 pub use types::{AuthMethod, Behavior, PublicKey, Request, SecretKey, TransportError};
 pub use wire::DisconnectReason;
 
-fn unwrap_unreachable<T, E>(value: Result<T, E>) -> T {
-    let Ok(inner) = value else { unreachable!() };
-    inner // avoids invoking expensive Debug code
+fn unwrap_unreachable<T>(value: Option<T>) -> T {
+    value.unwrap_or_else(|| unreachable!())
 }
 
 pub extern crate ed25519_dalek;

@@ -5,7 +5,9 @@ use crate::wire::into_u32;
 /// Destination of data written to a channel.
 #[derive(Debug, Clone, Copy)]
 pub enum Pipe {
+    /// Standard output.
     Stdout,
+    /// Standard error.
     Stderr,
 }
 

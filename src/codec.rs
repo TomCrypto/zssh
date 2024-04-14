@@ -120,7 +120,7 @@ impl<'a> ObjectReader<'a> {
     }
 
     pub fn read_byte_array<const N: usize>(&mut self) -> Result<&'a [u8; N], ProtocolError> {
-        Ok(crate::unwrap_unreachable(self.consume(N)?.try_into()))
+        Ok(crate::unwrap_unreachable(self.consume(N)?.try_into().ok()))
     }
 
     pub fn read_boolean(&mut self) -> Result<bool, ProtocolError> {

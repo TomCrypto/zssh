@@ -8,13 +8,21 @@ use rand::{CryptoRng, Rng};
 /// Secret key associated with a host server.
 #[derive(Debug)]
 pub enum SecretKey {
-    Ed25519 { secret_key: SigningKey },
+    /// An Ed25519 secret key.
+    Ed25519 {
+        /// The secret key.
+        secret_key: SigningKey,
+    },
 }
 
 /// Public key associated with a user identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicKey {
-    Ed25519 { public_key: VerifyingKey },
+    /// An Ed25519 public key.
+    Ed25519 {
+        /// The public key.
+        public_key: VerifyingKey,
+    },
 }
 
 impl<'a> From<&'a PublicKey> for wire::PublicKey<'a> {
@@ -30,7 +38,9 @@ impl<'a> From<&'a PublicKey> for wire::PublicKey<'a> {
 /// Authentication method that a user may choose.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthMethod {
+    /// No authentication provided.
     None,
+    /// Public-key authentication.
     PublicKey(PublicKey),
 }
 
@@ -45,11 +55,13 @@ pub enum Request<T> {
 
 /// Description of aspects of the server's behavior.
 pub trait Behavior {
+    /// The underlying stream type.
     type Stream: Read + Write;
 
     /// The underlying stream type to be used.
     fn stream(&mut self) -> &mut Self::Stream;
 
+    /// The underlying random type.
     type Random: CryptoRng + Rng;
 
     /// The underlying random type to be used.
@@ -74,6 +86,7 @@ pub trait Behavior {
     /// This may be called more than once if the client uses probe requests.
     fn allow_user(&mut self, username: &str, auth_method: &AuthMethod) -> Option<Self::User>;
 
+    /// Type representing an authenticated user.
     type User: Clone;
 
     /// Whether to allow shell channel requests.
@@ -84,6 +97,7 @@ pub trait Behavior {
         false
     }
 
+    /// Type representing a user-supplied command.
     type Command: Clone;
 
     /// Parse a user-supplied command string into a command.
