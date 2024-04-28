@@ -19,8 +19,8 @@ This library is still in early development. Features may be added and the API ma
 | ---:              | :---:                 | ---:                                  |
 | Key Exchange      | :heavy_check_mark:    | `curve25519-sha256`                   |
 | Host Key          | :heavy_check_mark:    | `ssh-ed25519`                         |
-| Encryption        | :heavy_check_mark:    | `aes128-ctr`                          |
-| Integrity         | :heavy_check_mark:    | `hmac-256`                            |
+| Encryption        | :heavy_check_mark:    | `chacha20-poly1305@openssh.com`       |
+| Integrity         | :heavy_check_mark:    | (implicit)                            |
 | Compression       | :x:                   | `none`                                |
 | Authentication    | :heavy_check_mark:    | `none`, `publickey`                   |
 | Public-Key Auth   | :heavy_check_mark:    | `ssh-ed25519`                         |
@@ -73,9 +73,9 @@ However, please note that:
 
 ## Performance
 
-The library depends on the async I/O traits from [`embedded-io-async`](https://crates.io/crates/embedded-io-async) and is written in an essentially zero-copy fashion. It is expected the main performance bottleneck will simply be the transport-layer encryption overhead. In terms of memory usage, the transport borrows an externally-provided byte slice which it will use as a packet buffer, while its internal state machine requires around 2-3kB of memory (most of it consisting of cryptographic key material) with low stack usage.
+The library depends on the async I/O traits from [`embedded-io-async`](https://crates.io/crates/embedded-io-async) and is written in an essentially zero-copy fashion. It is expected the main performance bottleneck will simply be the transport-layer encryption overhead. In terms of memory usage, the transport borrows an externally-provided byte slice which it will use as a packet buffer, while its internal state machine requires around 1-2kB of memory (largely consisting of key material and other cryptographic state) with low stack usage.
 
-While the SSH specification mandates a minimum packet buffer size of around 32kB, in practice most clients will work out of the box with sizes as low as 4kB, and even smaller packet buffers can be made to work with suitably configured clients; in general, the limiting factor is the size of the client's initial KEXINIT message.
+While the SSH specification mandates a minimum packet buffer size of 32768 bytes, in practice most clients will work out of the box with sizes as low as 4kB, and even smaller packet buffers can be made to work with suitably configured clients; in general, the limiting factor is the size of the client's initial KEXINIT message.
 
 This makes `zssh` usable on the vast majority of embedded targets where running an SSH server would make sense to begin with.
 

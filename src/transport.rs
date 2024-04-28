@@ -4,14 +4,13 @@ use crate::error::{Error, ProtocolError};
 use crate::types::{self, AuthMethod, Behavior, Request, SecretKey, TransportError};
 use crate::wire;
 
-use aes::cipher::{KeyIvInit, StreamCipher};
-use aes::Aes128Enc;
+use chacha20::cipher::{KeyInit, KeyIvInit, StreamCipher, StreamCipherSeek};
+use chacha20::ChaCha20Legacy;
 use constant_time_eq::constant_time_eq;
 use core::ops::Range;
-use ctr::Ctr128BE;
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use embedded_io_async::{Read, Write};
-use hmac::{Hmac, Mac};
+use poly1305::Poly1305;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey};
@@ -20,8 +19,9 @@ const KEXINIT_KEX_ALGORITHM: &str = "curve25519-sha256";
 const KEXINIT_STRICT_KEX_CLIENT: &str = "kex-strict-c-v00@openssh.com";
 const KEXINIT_KEX: &str = "curve25519-sha256,kex-strict-s-v00@openssh.com";
 const KEXINIT_HOST_KEY: &str = "ssh-ed25519";
-const KEXINIT_ENCRYPTION: &str = "aes128-ctr";
-const KEXINIT_MAC: &str = "hmac-sha2-256";
+const KEXINIT_ENCRYPTION: &str = "chacha20-poly1305@openssh.com";
+// TODO: this violates RFC4253 but seems to be most compatible
+const KEXINIT_MAC: &str = "";
 const KEXINIT_COMPRESSION: &str = "none";
 
 struct KexState {
@@ -35,10 +35,10 @@ struct PendingKeys {
 }
 
 struct KeyMaterial {
-    client_enc_ctx: Ctr128BE<Aes128Enc>,
-    client_mac_ctx: Hmac<Sha256>,
-    server_enc_ctx: Ctr128BE<Aes128Enc>,
-    server_mac_ctx: Hmac<Sha256>,
+    client_head_key: [u8; 32],
+    client_main_key: [u8; 32],
+    server_head_key: [u8; 32],
+    server_main_key: [u8; 32],
     session_id: [u8; 32],
 }
 
@@ -119,6 +119,8 @@ pub struct Transport<'a, T: Behavior> {
 impl<'a, T: Behavior> Transport<'a, T> {
     /// Creates a new transport from a packet buffer and behavior.
     pub fn new(buffer: &'a mut [u8], behavior: T) -> Self {
+        assert!(buffer.len() >= 512, "packet buffer too small");
+
         Self {
             buffer,
             behavior,
@@ -227,7 +229,9 @@ impl<'a, T: Behavior> Transport<'a, T> {
             Pipe::Stderr => 13,
         };
 
-        let slice = &mut self.buffer[payload_offset..];
+        let payload_range = self.payload_range_full();
+
+        let slice = &mut self.buffer[payload_range][payload_offset..];
 
         if slice.len() > max_packet_size {
             &mut slice[..max_packet_size]
@@ -237,7 +241,12 @@ impl<'a, T: Behavior> Transport<'a, T> {
     }
 
     fn maximum_channel_data_packet_size(&mut self) -> u32 {
-        wire::into_u32(self.buffer.len() - 9) // see above
+        let range = self.payload_range_full();
+
+        // The same principle applies to "stdin" ChannelData messages, we can compute the
+        // largest data packet size we can receive without overflowing our packet buffer.
+
+        wire::into_u32(range.end - range.start - 9)
     }
 
     pub(crate) async fn channel_adjust(
@@ -305,11 +314,11 @@ impl<'a, T: Behavior> Transport<'a, T> {
                         return Ok(None);
                     }
 
-                    if let Some(payload) = self.poll_client().await? {
+                    if let Some(payload_len) = self.poll_client().await? {
                         if let wire::Message::ChannelData {
                             data: wire::Data::Borrowed { bytes },
                             ..
-                        } = wire::Message::decode(&self.buffer[payload])?
+                        } = wire::Message::decode(&self.buffer[self.payload_range(payload_len)])?
                         {
                             return Ok(Some(bytes));
                         } else {
@@ -400,15 +409,15 @@ impl<'a, T: Behavior> Transport<'a, T> {
         Ok(())
     }
 
-    async fn poll_client(&mut self) -> Result<Option<Range<usize>>, TransportError<T>> {
+    async fn poll_client(&mut self) -> Result<Option<usize>, TransportError<T>> {
         if self.client_ssh_id_length == 0 {
             self.perform_handshake().await?;
         }
 
         let mut reason = wire::DisconnectReason::ProtocolError;
 
-        let payload = self.recv().await?; // we sometimes need the raw bytes
-        let message = wire::Message::decode(&self.buffer[payload.clone()])?;
+        let payload_len = self.recv().await?; // we sometimes need the message payload bytes
+        let message = wire::Message::decode(&self.buffer[self.payload_range(payload_len)])?;
 
         match message {
             wire::Message::KexInit {
@@ -416,8 +425,6 @@ impl<'a, T: Behavior> Transport<'a, T> {
                 server_host_key_algorithms,
                 encryption_algorithms_client_to_server,
                 encryption_algorithms_server_to_client,
-                mac_algorithms_client_to_server,
-                mac_algorithms_server_to_client,
                 compression_algorithms_client_to_server,
                 compression_algorithms_server_to_client,
                 first_kex_packet_follows,
@@ -468,17 +475,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
                     ));
                 }
 
-                if mac_algorithms_client_to_server.find(KEXINIT_MAC).is_none() {
-                    return Err(Error::ServerDisconnect(
-                        wire::DisconnectReason::KeyExchangeFailed,
-                    ));
-                }
-
-                if mac_algorithms_server_to_client.find(KEXINIT_MAC).is_none() {
-                    return Err(Error::ServerDisconnect(
-                        wire::DisconnectReason::KeyExchangeFailed,
-                    ));
-                }
+                // We use an AEAD cipher that doesn't require (and forbids) MAC algorithm negotiation.
 
                 if compression_algorithms_client_to_server
                     .find(KEXINIT_COMPRESSION)
@@ -503,10 +500,8 @@ impl<'a, T: Behavior> Transport<'a, T> {
 
                 let mut discard_guessed = false;
 
-                if first_kex_packet_follows {
-                    if kex_index != Some(0) || host_key_index != Some(0) {
-                        discard_guessed = true;
-                    }
+                if first_kex_packet_follows && (kex_index != Some(0) || host_key_index != Some(0)) {
+                    discard_guessed = true;
                 }
 
                 let mut cookie = [0u8; 16];
@@ -549,9 +544,12 @@ impl<'a, T: Behavior> Transport<'a, T> {
                     .hash_string_utf8(self.client_ssh_id_string());
                 kex.exchange_hash_hasher
                     .hash_string_utf8(self.behavior.server_id());
-                kex.exchange_hash_hasher.hash_string(&self.buffer[payload]);
+                kex.exchange_hash_hasher
+                    .hash_string(&self.buffer[self.payload_range(payload_len)]);
 
-                let payload = kex_init_message.encode(self.buffer)?;
+                let payload_range = self.payload_range_full();
+
+                let payload = kex_init_message.encode(&mut self.buffer[payload_range])?;
 
                 kex.exchange_hash_hasher.hash_string(payload);
 
@@ -651,81 +649,31 @@ impl<'a, T: Behavior> Transport<'a, T> {
             }
             wire::Message::NewKeys => {
                 if let Some(keys) = self.next_keys.take() {
-                    self.send(wire::Message::NewKeys).await?;
-
-                    let mut iv_client_hash = keys.prefix_hash.clone();
-
-                    iv_client_hash.hash_byte(b'A');
-                    iv_client_hash.hash_byte_array(&keys.session_id);
-
-                    let iv_client_tmp: [u8; 32] = iv_client_hash.into_digest().into();
-                    let mut iv_client: [u8; 16] = [0u8; 16];
-                    iv_client.copy_from_slice(&iv_client_tmp[..16]);
-
-                    let mut iv_server_hash = keys.prefix_hash.clone();
-
-                    iv_server_hash.hash_byte(b'B');
-                    iv_server_hash.hash_byte_array(&keys.session_id);
-
-                    let iv_server_tmp: [u8; 32] = iv_server_hash.into_digest().into();
-                    let mut iv_server: [u8; 16] = [0u8; 16];
-                    iv_server.copy_from_slice(&iv_server_tmp[..16]);
-
                     let mut enc_key_client_hash = keys.prefix_hash.clone();
-
                     enc_key_client_hash.hash_byte(b'C');
                     enc_key_client_hash.hash_byte_array(&keys.session_id);
-
-                    let enc_key_client_tmp: [u8; 32] = enc_key_client_hash.into_digest().into();
-                    let mut enc_key_client: [u8; 16] = [0u8; 16];
-                    enc_key_client.copy_from_slice(&enc_key_client_tmp[..16]);
-
-                    let enc_client =
-                        Ctr128BE::<Aes128Enc>::new(&enc_key_client.into(), &iv_client.into());
+                    let client_enc_k1 = enc_key_client_hash.into_digest();
 
                     let mut enc_key_server_hash = keys.prefix_hash.clone();
-
                     enc_key_server_hash.hash_byte(b'D');
                     enc_key_server_hash.hash_byte_array(&keys.session_id);
+                    let server_enc_k1 = enc_key_server_hash.into_digest();
 
-                    let enc_key_server_tmp: [u8; 32] = enc_key_server_hash.into_digest().into();
-                    let mut enc_key_server: [u8; 16] = [0u8; 16];
-                    enc_key_server.copy_from_slice(&enc_key_server_tmp[..16]);
+                    let mut digest = keys.prefix_hash.clone();
+                    digest.hash_byte_array(&client_enc_k1);
+                    let client_enc_k2 = digest.into_digest();
 
-                    let enc_server =
-                        Ctr128BE::<Aes128Enc>::new(&enc_key_server.into(), &iv_server.into());
+                    let mut digest = keys.prefix_hash.clone();
+                    digest.hash_byte_array(&server_enc_k1);
+                    let server_enc_k2 = digest.into_digest();
 
-                    let mut mac_key_client_hash = keys.prefix_hash.clone();
-
-                    mac_key_client_hash.hash_byte(b'E');
-                    mac_key_client_hash.hash_byte_array(&keys.session_id);
-
-                    let mac_key_client: [u8; 32] = mac_key_client_hash.into_digest().into();
-
-                    let mut mac_key_server_hash = keys.prefix_hash.clone();
-
-                    mac_key_server_hash.hash_byte(b'F');
-                    mac_key_server_hash.hash_byte_array(&keys.session_id);
-
-                    let mac_key_server: [u8; 32] = mac_key_server_hash.into_digest().into();
-
-                    let mut padded = [0u8; 64];
-
-                    padded[0..32].copy_from_slice(&mac_key_client);
-
-                    let client_mac_ctx = Hmac::<Sha256>::new(&padded.into());
-
-                    let mut padded = [0u8; 64];
-
-                    padded[0..32].copy_from_slice(&mac_key_server);
-
-                    let server_mac_ctx = Hmac::<Sha256>::new(&padded.into());
+                    self.send(wire::Message::NewKeys).await?;
 
                     self.curr_keys = Some(KeyMaterial {
-                        client_enc_ctx: enc_client,
-                        server_enc_ctx: enc_server,
-                        client_mac_ctx,
-                        server_mac_ctx,
+                        client_head_key: client_enc_k2.into(),
+                        client_main_key: client_enc_k1.into(),
+                        server_head_key: server_enc_k2.into(),
+                        server_main_key: server_enc_k1.into(),
                         session_id: keys.session_id,
                     });
 
@@ -966,7 +914,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
                         channel_state
                             .rx_half
                             .decrease_window(wire::into_u32(bytes.len()))?;
-                        return Ok(Some(payload));
+                        return Ok(Some(payload_len));
                     }
                 }
             }
@@ -1136,193 +1084,164 @@ impl<'a, T: Behavior> Transport<'a, T> {
         Err(Error::ServerDisconnect(reason))
     }
 
-    fn block_size(&self) -> usize {
-        if self.curr_keys.is_some() {
-            16
-        } else {
-            8
-        }
-    }
-
     async fn send_preencoded_payload(
         &mut self,
         payload_len: usize,
     ) -> Result<(), TransportError<T>> {
         self.server_sequence_number = self.server_sequence_number.wrapping_add(1);
 
-        if let Some(ctx) = &mut self.curr_keys {
-            ctx.server_mac_ctx
-                .update(&self.server_sequence_number.to_be_bytes());
-        }
+        // NOTE: padding rules differ for AEAD cipher modes
 
-        // compute required padding length
-
-        let mut padding_len = self.block_size() - (4 + 1 + payload_len) % self.block_size();
+        let mut padding_len = if self.curr_keys.is_some() {
+            (7usize.wrapping_sub(payload_len)) % 8
+        } else {
+            (3usize.wrapping_sub(payload_len)) % 8
+        };
 
         if padding_len < 4 {
-            padding_len += self.block_size();
+            padding_len += 8;
         }
-
-        // build up the header
 
         let packet_len = wire::into_u32(1 + payload_len + padding_len);
-
-        let mut header = [0u8; 5];
-
-        header[..4].copy_from_slice(&packet_len.to_be_bytes());
-        header[4] = padding_len as u8;
+        self.buffer[..4].copy_from_slice(&packet_len.to_be_bytes());
 
         if let Some(ctx) = &mut self.curr_keys {
-            ctx.server_mac_ctx.update(&header);
-            ctx.server_enc_ctx.apply_keystream(&mut header);
+            let mut cipher = ChaCha20Legacy::new(
+                (&ctx.server_head_key).into(),
+                (&(self.server_sequence_number as u64).to_be_bytes()).into(),
+            );
+
+            cipher.apply_keystream(&mut self.buffer[..4]);
         }
 
-        self.behavior.stream().write_all(&header).await?;
-
-        // send the payload
-
-        if let Some(ctx) = &mut self.curr_keys {
-            ctx.server_mac_ctx.update(&self.buffer[..payload_len]);
-            ctx.server_enc_ctx
-                .apply_keystream(&mut self.buffer[..payload_len]);
-        }
-
-        self.behavior
-            .stream()
-            .write_all(&self.buffer[..payload_len])
-            .await?;
-
-        // issue padding
+        self.buffer[4] = padding_len as u8;
 
         self.behavior
             .random()
-            .fill_bytes(&mut self.buffer[..padding_len]);
+            .fill_bytes(&mut self.buffer[5 + payload_len..][..padding_len]);
 
         if let Some(ctx) = &mut self.curr_keys {
-            ctx.server_mac_ctx.update(&self.buffer[..padding_len]);
-            ctx.server_enc_ctx
-                .apply_keystream(&mut self.buffer[..padding_len]);
-        }
+            let (ciphertext, tag_buf) = self.buffer.split_at_mut(5 + payload_len + padding_len);
 
-        self.behavior
-            .stream()
-            .write_all(&self.buffer[..padding_len])
-            .await?;
+            let sequence_number = self.server_sequence_number as u64;
 
-        // finally, write out the MAC
+            let mut cipher = ChaCha20Legacy::new(
+                (&ctx.server_main_key).into(),
+                (&sequence_number.to_be_bytes()).into(),
+            );
 
-        if let Some(ctx) = &mut self.curr_keys {
-            let mac_tag: [u8; 32] = ctx.server_mac_ctx.finalize_reset().into_bytes().into();
+            let mut mac_key = [0u8; 32];
+            cipher.apply_keystream(&mut mac_key);
+            let mac = Poly1305::new((&mac_key).into());
 
-            self.behavior.stream().write_all(&mac_tag).await?;
+            cipher.seek(64);
+            cipher.apply_keystream(&mut ciphertext[4..]);
+
+            let tag = mac.compute_unpadded(ciphertext);
+            tag_buf[..16].copy_from_slice(&tag);
+
+            self.behavior
+                .stream()
+                .write_all(&self.buffer[..5 + payload_len + padding_len + 16])
+                .await?;
+        } else {
+            self.behavior
+                .stream()
+                .write_all(&self.buffer[..5 + payload_len + padding_len])
+                .await?;
         }
 
         Ok(())
     }
 
     async fn send(&mut self, message: wire::Message<'_>) -> Result<(), TransportError<T>> {
-        let payload_len = message.encode(self.buffer)?.len();
+        let payload_range = self.payload_range_full();
+
+        let payload_len = message.encode(&mut self.buffer[payload_range])?.len();
         self.send_preencoded_payload(payload_len).await
     }
 
-    async fn recv(&mut self) -> Result<Range<usize>, TransportError<T>> {
+    async fn recv(&mut self) -> Result<usize, TransportError<T>> {
         self.client_sequence_number = self.client_sequence_number.wrapping_add(1);
 
-        if let Some(ctx) = &mut self.curr_keys {
-            ctx.client_mac_ctx
-                .update(&self.client_sequence_number.to_be_bytes());
-        }
+        self.behavior
+            .stream()
+            .read_exact(&mut self.buffer[..4])
+            .await?;
 
-        // Since we know that we only use "aes128-ctr" which is a streaming mode
-        // of encryption, we can unconditionally receive 5 bytes and decrypt it.
-
-        let mut header = [0u8; 5];
-
-        self.behavior.stream().read_exact(&mut header).await?;
+        let mut decrypted_packet_len = [0u8; 4];
+        decrypted_packet_len.copy_from_slice(&self.buffer[..4]);
 
         if let Some(ctx) = &mut self.curr_keys {
-            ctx.client_enc_ctx.apply_keystream(&mut header);
-            ctx.client_mac_ctx.update(&header);
+            let mut cipher = ChaCha20Legacy::new(
+                (&ctx.client_head_key).into(),
+                (&(self.client_sequence_number as u64).to_be_bytes()).into(),
+            );
+
+            cipher.apply_keystream(&mut decrypted_packet_len);
         }
 
-        let packet_length = wire::from_u32(u32::from_be_bytes([
-            header[0], header[1], header[2], header[3],
-        ]));
+        let packet_len = wire::from_u32(u32::from_be_bytes(decrypted_packet_len));
 
-        if packet_length == 0 || (4 + packet_length) % self.block_size() != 0 {
+        // NOTE: padding rules differ for AEAD cipher modes
+
+        let padding_remainder = if self.curr_keys.is_some() { 0 } else { 4 };
+
+        if packet_len < padding_remainder + 8 {
             Err(ProtocolError::MalformedPacket)?;
         }
 
-        // extract and verify padding length
-
-        let padding_len: usize = header[4].into();
-
-        if padding_len < 4 || padding_len >= packet_length {
+        if packet_len % 8 != padding_remainder {
             Err(ProtocolError::MalformedPacket)?;
         }
 
-        // Figure out how long the payload is based on this
+        let mac_len = if self.curr_keys.is_some() { 16 } else { 0 };
 
-        let payload_len = packet_length - 1 - padding_len;
-
-        // Ensure the buffer size is sufficient
-
-        if payload_len > self.buffer.len() {
+        if 4 + packet_len + mac_len > self.buffer.len() {
             Err(ProtocolError::BufferExhausted)?;
         }
 
         self.behavior
             .stream()
-            .read_exact(&mut self.buffer[..payload_len])
+            .read_exact(&mut self.buffer[4..4 + packet_len + mac_len])
             .await?;
 
         if let Some(ctx) = &mut self.curr_keys {
-            ctx.client_enc_ctx
-                .apply_keystream(&mut self.buffer[..payload_len]);
-            ctx.client_mac_ctx.update(&self.buffer[..payload_len]);
-        }
+            let (ciphertext, tag_buf) = self.buffer.split_at_mut(4 + packet_len);
 
-        // Finally, read and include the padding...
+            let mut cipher = ChaCha20Legacy::new(
+                (&ctx.client_main_key).into(),
+                (&(self.client_sequence_number as u64).to_be_bytes()).into(),
+            );
 
-        let mut padding_buffer: [u8; 32] = [0u8; 32];
+            let mut mac_key = [0u8; 32];
+            cipher.apply_keystream(&mut mac_key);
+            let mac = Poly1305::new((&mac_key).into());
 
-        let mut remaining_padding_bytes = padding_len;
-
-        while remaining_padding_bytes != 0 {
-            let to_read = usize::min(remaining_padding_bytes, padding_buffer.len());
-
-            self.behavior
-                .stream()
-                .read_exact(&mut padding_buffer[..to_read])
-                .await?;
-
-            if let Some(ctx) = &mut self.curr_keys {
-                ctx.client_enc_ctx
-                    .apply_keystream(&mut padding_buffer[..to_read]);
-                ctx.client_mac_ctx.update(&padding_buffer[..to_read]);
-            }
-
-            remaining_padding_bytes -= to_read;
-        }
-
-        // Then check the MAC, if one is present
-
-        if let Some(ctx) = &mut self.curr_keys {
-            let mut mac: [u8; 32] = [0u8; 32];
-
-            self.behavior.stream().read_exact(&mut mac).await?;
-
-            let mac_tag: [u8; 32] = ctx.client_mac_ctx.finalize_reset().into_bytes().into();
+            let tag = mac.compute_unpadded(ciphertext);
 
             // DO NOT report a MAC verification error to the client for security
             // reasons, just disconnect immediately and let it reinitiate later.
 
-            if !constant_time_eq(&mac_tag, &mac) {
+            if !constant_time_eq(&tag, &tag_buf[..16]) {
                 Err(ProtocolError::MalformedPacket)?;
             }
+
+            cipher.seek(64);
+            cipher.apply_keystream(&mut ciphertext[4..]);
         }
 
-        Ok(0..payload_len)
+        let padding_len: usize = self.buffer[4] as usize;
+
+        if padding_len < 4 {
+            Err(ProtocolError::MalformedPacket)?;
+        }
+
+        if packet_len < 1 + padding_len {
+            Err(ProtocolError::MalformedPacket)?;
+        }
+
+        Ok(packet_len - 1 - padding_len)
     }
 
     /// Disconnects from the client with a given reason.
@@ -1367,5 +1286,13 @@ impl<'a, T: Behavior> Transport<'a, T> {
         }
 
         Ok(())
+    }
+
+    fn payload_range(&self, payload_len: usize) -> Range<usize> {
+        5..5 + payload_len
+    }
+
+    fn payload_range_full(&self) -> Range<usize> {
+        5..self.buffer.len() - 255 - 16
     }
 }
