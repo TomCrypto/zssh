@@ -2,7 +2,7 @@ use crate::channel::{Channel, Pipe};
 use crate::codec::{ObjectHasher, ObjectWriter};
 use crate::error::{Error, ProtocolError};
 use crate::types::{self, AuthMethod, Behavior, Request, SecretKey, TransportError};
-use crate::wire::{self, NameList};
+use crate::wire;
 
 use aes::cipher::{KeyIvInit, StreamCipher};
 use aes::Aes128Enc;
@@ -21,14 +21,6 @@ const KEXINIT_HOST_KEY: &str = "ssh-ed25519";
 const KEXINIT_ENCRYPTION: &str = "aes128-ctr";
 const KEXINIT_MAC: &str = "hmac-sha2-256";
 const KEXINIT_COMPRESSION: &str = "none";
-
-fn kex_client_bad_guess(name_list: NameList, expected: &str) -> bool {
-    if let Some(first) = name_list.iter().next() {
-        first != expected
-    } else {
-        false
-    }
-}
 
 struct KexState {
     discard_guessed: bool,
@@ -411,7 +403,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
 
         let mut reason = wire::DisconnectReason::ProtocolError;
 
-        let payload = self.recv().await?; // message payload if needed
+        let payload = self.recv().await?; // we sometimes need the raw bytes
         let message = wire::Message::decode(&self.buffer[payload.clone()])?;
 
         match message {
@@ -427,46 +419,76 @@ impl<'a, T: Behavior> Transport<'a, T> {
                 first_kex_packet_follows,
                 ..
             } if self.kex.is_none() => {
-                let mut discard_client_guess = false;
+                // We only have one algorithm for each name list, so the selection algorithm
+                // boils down to "does the client have our algorithm in their list". Process
+                // the kex and host_key algorithms specially if a guessed packet is sent.
 
-                if kex_client_bad_guess(kex_algorithms, KEXINIT_KEX) {
-                    discard_client_guess = true;
+                let kex_index = kex_algorithms.find(KEXINIT_KEX);
+                let host_key_index = server_host_key_algorithms.find(KEXINIT_HOST_KEY);
+
+                if kex_index.is_none() || host_key_index.is_none() {
+                    return Err(Error::ServerDisconnect(
+                        wire::DisconnectReason::KeyExchangeFailed,
+                    ));
                 }
 
-                if kex_client_bad_guess(server_host_key_algorithms, KEXINIT_HOST_KEY) {
-                    discard_client_guess = true;
-                }
-
-                if kex_client_bad_guess(encryption_algorithms_client_to_server, KEXINIT_ENCRYPTION)
+                if encryption_algorithms_client_to_server
+                    .find(KEXINIT_ENCRYPTION)
+                    .is_none()
                 {
-                    discard_client_guess = true;
+                    return Err(Error::ServerDisconnect(
+                        wire::DisconnectReason::KeyExchangeFailed,
+                    ));
                 }
 
-                if kex_client_bad_guess(encryption_algorithms_server_to_client, KEXINIT_ENCRYPTION)
+                if encryption_algorithms_server_to_client
+                    .find(KEXINIT_ENCRYPTION)
+                    .is_none()
                 {
-                    discard_client_guess = true;
+                    return Err(Error::ServerDisconnect(
+                        wire::DisconnectReason::KeyExchangeFailed,
+                    ));
                 }
 
-                if kex_client_bad_guess(mac_algorithms_client_to_server, KEXINIT_MAC) {
-                    discard_client_guess = true;
+                if mac_algorithms_client_to_server.find(KEXINIT_MAC).is_none() {
+                    return Err(Error::ServerDisconnect(
+                        wire::DisconnectReason::KeyExchangeFailed,
+                    ));
                 }
 
-                if kex_client_bad_guess(mac_algorithms_server_to_client, KEXINIT_MAC) {
-                    discard_client_guess = true;
+                if mac_algorithms_server_to_client.find(KEXINIT_MAC).is_none() {
+                    return Err(Error::ServerDisconnect(
+                        wire::DisconnectReason::KeyExchangeFailed,
+                    ));
                 }
 
-                if kex_client_bad_guess(
-                    compression_algorithms_client_to_server,
-                    KEXINIT_COMPRESSION,
-                ) {
-                    discard_client_guess = true;
+                if compression_algorithms_client_to_server
+                    .find(KEXINIT_COMPRESSION)
+                    .is_none()
+                {
+                    return Err(Error::ServerDisconnect(
+                        wire::DisconnectReason::KeyExchangeFailed,
+                    ));
                 }
 
-                if kex_client_bad_guess(
-                    compression_algorithms_server_to_client,
-                    KEXINIT_COMPRESSION,
-                ) {
-                    discard_client_guess = true;
+                if compression_algorithms_server_to_client
+                    .find(KEXINIT_COMPRESSION)
+                    .is_none()
+                {
+                    return Err(Error::ServerDisconnect(
+                        wire::DisconnectReason::KeyExchangeFailed,
+                    ));
+                }
+
+                // If the kex or host key algorithms were not the client's preferred algorithm, their guess
+                // will be wrong so we must discard the guessed key exchange packet they will have sent us.
+
+                let mut discard_guessed = false;
+
+                if first_kex_packet_follows {
+                    if kex_index != Some(0) || host_key_index != Some(0) {
+                        discard_guessed = true;
+                    }
                 }
 
                 let mut cookie = [0u8; 16];
@@ -501,8 +523,8 @@ impl<'a, T: Behavior> Transport<'a, T> {
                 };
 
                 let mut kex = KexState {
-                    discard_guessed: discard_client_guess && first_kex_packet_follows,
                     exchange_hash_hasher: ObjectHasher::new(Sha256::new()),
+                    discard_guessed,
                 };
 
                 kex.exchange_hash_hasher
@@ -529,6 +551,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
                 if let Some(mut kex) = self.kex.take() {
                     if core::mem::replace(&mut kex.discard_guessed, false) {
                         self.kex = Some(kex);
+                        return Ok(None);
                     } else if let Ok(client_ephemeral_public_key) =
                         <&[u8] as TryInto<[u8; 32]>>::try_into(client_ephemeral_public_key)
                     {
@@ -967,12 +990,15 @@ impl<'a, T: Behavior> Transport<'a, T> {
                         want_reply,
                         command,
                     },
-            } if self.authenticated && self.request.is_none() && want_reply => {
+            } if self.authenticated && self.request.is_none() => {
                 if let Some(channel_state) = &mut self.active_channel {
                     if channel_state.rx_channel_id == recipient_channel {
                         self.request = Some(Request::Exec(self.behavior.parse_command(command)));
-                        self.send(wire::Message::ChannelSuccess { recipient_channel })
-                            .await?;
+
+                        if want_reply {
+                            self.send(wire::Message::ChannelSuccess { recipient_channel })
+                                .await?;
+                        }
 
                         return Ok(None);
                     }
@@ -998,16 +1024,15 @@ impl<'a, T: Behavior> Transport<'a, T> {
             wire::Message::ChannelRequest {
                 recipient_channel,
                 request: wire::Request::Shell { want_reply },
-            } if self.authenticated
-                && self.request.is_none()
-                && want_reply
-                && self.behavior.allow_shell() =>
-            {
+            } if self.authenticated && self.request.is_none() && self.behavior.allow_shell() => {
                 if let Some(channel_state) = &mut self.active_channel {
                     if channel_state.rx_channel_id == recipient_channel {
                         self.request = Some(Request::Shell);
-                        self.send(wire::Message::ChannelSuccess { recipient_channel })
-                            .await?;
+
+                        if want_reply {
+                            self.send(wire::Message::ChannelSuccess { recipient_channel })
+                                .await?;
+                        }
 
                         return Ok(None);
                     }

@@ -1,7 +1,7 @@
 [package]
 name = "zssh"
 edition = "2021"
-version = "0.2.1"
+version = "0.3.0"
 authors = ["Thomas Bénéteau <thomas@bitwise.me>"]
 description = "Minimal SSH server for embedded applications."
 documentation = "https://docs.rs/zssh"

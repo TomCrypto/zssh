@@ -180,6 +180,7 @@ async fn handle_client(stream: TcpStream) -> Result<(), TransportError<ExampleBe
                 // buffer, correct code might chunk as needed to ensure that it will.
 
                 use std::io::Write;
+
                 writeln!(&mut buffer, "Sum = {}", sum).unwrap();
 
                 let bytes_written = bytes_available - buffer.len();

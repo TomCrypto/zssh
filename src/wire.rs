@@ -587,6 +587,10 @@ impl<'a> NameList<'a> {
         self.string
     }
 
+    pub fn find(&self, name: &str) -> Option<usize> {
+        self.iter().position(|item| item == name)
+    }
+
     pub fn decode_with(reader: &mut ObjectReader<'a>) -> Result<Self, ProtocolError> {
         Self::new_from_string(reader.read_string_utf8()?)
     }

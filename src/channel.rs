@@ -97,22 +97,17 @@ impl<'a, 'b, T: Behavior> Channel<'a, 'b, T> {
     }
 
     async fn write_all(&mut self, pipe: Pipe, bytes: &[u8]) -> Result<(), TransportError<T>> {
-        let mut slice = bytes;
-
-        while !slice.is_empty() {
+        for chunk in bytes.chunks(self.payload_buffer_len(pipe)) {
             let mut writer = Writer::new(self.transport, pipe);
-
-            let bytes_written = usize::min(bytes.len(), writer.buffer().len());
-
-            let (transfer, slice_rest) = slice.split_at(bytes_written);
-            writer.buffer()[..bytes_written].copy_from_slice(transfer);
-
-            writer.write_all(bytes_written).await?;
-
-            slice = slice_rest;
+            writer.buffer()[..chunk.len()].copy_from_slice(chunk);
+            writer.write_all(chunk.len()).await?;
         }
 
         Ok(())
+    }
+
+    fn payload_buffer_len(&mut self, pipe: Pipe) -> usize {
+        self.writer(pipe).buffer().len()
     }
 }
 

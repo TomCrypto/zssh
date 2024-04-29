@@ -11,8 +11,8 @@
 //! The API is designed to be minimal and simple to use.
 
 #![no_std]
-#![forbid(unsafe_code)]
 #![forbid(missing_docs)]
+#![forbid(unsafe_code)]
 
 mod channel;
 mod codec;
