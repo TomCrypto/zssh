@@ -16,7 +16,9 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
-const KEXINIT_KEX: &str = "curve25519-sha256";
+const KEXINIT_KEX_ALGORITHM: &str = "curve25519-sha256";
+const KEXINIT_STRICT_KEX_CLIENT: &str = "kex-strict-c-v00@openssh.com";
+const KEXINIT_KEX: &str = "curve25519-sha256,kex-strict-s-v00@openssh.com";
 const KEXINIT_HOST_KEY: &str = "ssh-ed25519";
 const KEXINIT_ENCRYPTION: &str = "aes128-ctr";
 const KEXINIT_MAC: &str = "hmac-sha2-256";
@@ -96,6 +98,7 @@ pub struct Transport<'a, T: Behavior> {
     client_ssh_id_length: usize,
 
     kex: Option<KexState>,
+    strict_kex: bool,
 
     next_keys: Option<PendingKeys>,
     curr_keys: Option<KeyMaterial>,
@@ -124,6 +127,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
             client_ssh_id_length: 0,
 
             kex: None,
+            strict_kex: false,
 
             next_keys: None,
             curr_keys: None,
@@ -419,11 +423,25 @@ impl<'a, T: Behavior> Transport<'a, T> {
                 first_kex_packet_follows,
                 ..
             } if self.kex.is_none() => {
+                if self.curr_keys.is_none()
+                    && kex_algorithms.find(KEXINIT_STRICT_KEX_CLIENT).is_some()
+                {
+                    // Enable strict KEX mode for this transport as specified by OpenSSH
+
+                    self.strict_kex = true;
+
+                    if self.client_sequence_number != 0 {
+                        return Err(Error::ServerDisconnect(
+                            wire::DisconnectReason::ProtocolError,
+                        ));
+                    }
+                }
+
                 // We only have one algorithm for each name list, so the selection algorithm
                 // boils down to "does the client have our algorithm in their list". Process
                 // the kex and host_key algorithms specially if a guessed packet is sent.
 
-                let kex_index = kex_algorithms.find(KEXINIT_KEX);
+                let kex_index = kex_algorithms.find(KEXINIT_KEX_ALGORITHM);
                 let host_key_index = server_host_key_algorithms.find(KEXINIT_HOST_KEY);
 
                 if kex_index.is_none() || host_key_index.is_none() {
@@ -710,6 +728,11 @@ impl<'a, T: Behavior> Transport<'a, T> {
                         server_mac_ctx,
                         session_id: keys.session_id,
                     });
+
+                    if self.strict_kex {
+                        self.client_sequence_number = u32::MAX;
+                        self.server_sequence_number = u32::MAX;
+                    }
 
                     return Ok(None);
                 }
@@ -1058,9 +1081,21 @@ impl<'a, T: Behavior> Transport<'a, T> {
             wire::Message::Debug { .. }
             | wire::Message::Ignore { .. }
             | wire::Message::Unimplemented { .. } => {
+                if self.strict_kex && self.curr_keys.is_none() {
+                    return Err(Error::ServerDisconnect(
+                        wire::DisconnectReason::ProtocolError,
+                    ));
+                }
+
                 return Ok(None);
             }
             wire::Message::Unknown { .. } => {
+                if self.strict_kex && self.curr_keys.is_none() {
+                    return Err(Error::ServerDisconnect(
+                        wire::DisconnectReason::ProtocolError,
+                    ));
+                }
+
                 self.send(wire::Message::Unimplemented {
                     sequence_number: self.client_sequence_number,
                 })
