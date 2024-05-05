@@ -896,8 +896,6 @@ impl<'a, T: Behavior> Transport<'a, T> {
                         maximum_packet_size,
                     },
             } if self.authenticated => {
-                // check if sender_channel is already known, if so, die
-
                 for channel in self.channels.into_iter().flatten() {
                     if channel.sender_channel == sender_channel {
                         self.send(wire::Message::Disconnect {
@@ -910,19 +908,13 @@ impl<'a, T: Behavior> Transport<'a, T> {
                     }
                 }
 
-                // then, pick an empty spot. if none found, return error...
-
                 for channel in &mut self.channels {
                     if channel.is_none() {
-                        // save it, but DO NOT confirm it yet!!!
-
                         *channel = Some(PendingChannel {
                             sender_channel,
                             initial_window_size,
                             maximum_packet_size,
                         });
-
-                        // only confirm if there's no other active channel
 
                         if self.active_channel.is_none() {
                             self.dequeue_pending_channel().await?;
@@ -999,6 +991,20 @@ impl<'a, T: Behavior> Transport<'a, T> {
 
                         if let HalfState::Close = channel_state.tx_half {
                             self.dequeue_pending_channel().await?;
+                        } else if self.request.is_none() {
+                            let sender_channel = channel_state.tx_channel_id;
+
+                            self.send(wire::Message::ChannelEof {
+                                recipient_channel: sender_channel,
+                            })
+                            .await?;
+
+                            self.send(wire::Message::ChannelClose {
+                                recipient_channel: sender_channel,
+                            })
+                            .await?;
+
+                            self.dequeue_pending_channel().await?;
                         }
 
                         return Ok(None);
@@ -1019,8 +1025,12 @@ impl<'a, T: Behavior> Transport<'a, T> {
                         self.request = Some(Request::Exec(self.behavior.parse_command(command)));
 
                         if want_reply {
-                            self.send(wire::Message::ChannelSuccess { recipient_channel })
-                                .await?;
+                            let sender_channel = channel_state.tx_channel_id;
+
+                            self.send(wire::Message::ChannelSuccess {
+                                recipient_channel: sender_channel,
+                            })
+                            .await?;
                         }
 
                         return Ok(None);
@@ -1035,8 +1045,12 @@ impl<'a, T: Behavior> Transport<'a, T> {
                 if let Some(channel_state) = &mut self.active_channel {
                     if channel_state.rx_channel_id == recipient_channel {
                         if want_reply {
-                            self.send(wire::Message::ChannelSuccess { recipient_channel })
-                                .await?;
+                            let sender_channel = channel_state.tx_channel_id;
+
+                            self.send(wire::Message::ChannelSuccess {
+                                recipient_channel: sender_channel,
+                            })
+                            .await?;
                         }
 
                         return Ok(None);
@@ -1053,8 +1067,12 @@ impl<'a, T: Behavior> Transport<'a, T> {
                         self.request = Some(Request::Shell);
 
                         if want_reply {
-                            self.send(wire::Message::ChannelSuccess { recipient_channel })
-                                .await?;
+                            let sender_channel = channel_state.tx_channel_id;
+
+                            self.send(wire::Message::ChannelSuccess {
+                                recipient_channel: sender_channel,
+                            })
+                            .await?;
                         }
 
                         return Ok(None);
@@ -1069,8 +1087,12 @@ impl<'a, T: Behavior> Transport<'a, T> {
                 if let Some(channel_state) = &mut self.active_channel {
                     if channel_state.rx_channel_id == recipient_channel {
                         if request.want_reply() {
-                            self.send(wire::Message::ChannelFailure { recipient_channel })
-                                .await?;
+                            let sender_channel = channel_state.tx_channel_id;
+
+                            self.send(wire::Message::ChannelFailure {
+                                recipient_channel: sender_channel,
+                            })
+                            .await?;
                         }
 
                         return Ok(None);

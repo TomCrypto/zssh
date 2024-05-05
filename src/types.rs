@@ -75,7 +75,7 @@ pub trait Behavior {
     /// This will be sent to the client during the initial version handshake. It must
     /// comply with RFC4253 section 4.2 except it should not contain the final CR LF.
     fn server_id(&self) -> &'static str {
-        "SSH-2.0-zssh_0.3.1"
+        "SSH-2.0-zssh_0.3.2"
     }
 
     /// Allow a given user to authenticate with a given auth method.
