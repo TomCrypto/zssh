@@ -262,6 +262,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
         }
 
         let amount = amount.unwrap_or(u32::MAX);
+        assert!(amount != 0, "window is empty");
 
         match self.channel_state().rx_half {
             HalfState::Window(0) => {
@@ -299,19 +300,22 @@ impl<'a, T: Behavior> Transport<'a, T> {
                 }
                 HalfState::Window(amount) => {
                     if self.channel_state().rx_committed {
-                        let bytes_to_add = u32::MAX - amount;
+                        // Only re-adjust the window if it is smaller than the maximum data size, this
+                        // ensures we will only send a window adjust message approximately every 4GiB.
 
-                        let recipient_channel = self.channel_state().tx_channel_id;
+                        if amount < self.maximum_channel_data_packet_size() {
+                            let bytes_to_add = u32::MAX - amount;
 
-                        self.send(wire::Message::ChannelWindowAdjust {
-                            recipient_channel,
-                            bytes_to_add,
-                        })
-                        .await?;
+                            let recipient_channel = self.channel_state().tx_channel_id;
 
-                        self.channel_state().rx_half.increase_window(bytes_to_add)?;
-                    } else if amount == 0 {
-                        return Ok(None);
+                            self.send(wire::Message::ChannelWindowAdjust {
+                                recipient_channel,
+                                bytes_to_add,
+                            })
+                            .await?;
+
+                            self.channel_state().rx_half.increase_window(bytes_to_add)?;
+                        }
                     }
 
                     if let Some(payload_len) = self.poll_client().await? {
@@ -402,7 +406,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
                 }
             }
             HalfState::Eof | HalfState::Close => {
-                return Err(Error::UnexpectedEof);
+                unreachable!("channel tx half should not be eof or close");
             }
         }
 

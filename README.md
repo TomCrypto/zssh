@@ -55,7 +55,7 @@ Because of the no-allocation requirement, it is not possible for a channel to ha
 
 This constraint implies that you must specify an exact read length for all channel reads unless you are willing to never read again from the channel after you write to it. In the API, this manifests as `Channel::reader` taking an optional size, with the following semantics:
 
- - if a size is provided, the reader object will read up to that much, and you can still read and write on the channel afterwards;
+ - if a size is provided, the reader object **must** read up to that much, and the channel may then be read or written afterwards;
  - otherwise, it will read up to EOF, but you can **never** call `Channel::reader` again on the channel once you drop the reader.
 
 Also note the possible performance implications due to how the recv window is advertised to the client. If a size is provided to the reader, we will advertise that size as our recv window, so the client may not submit more than that many bytes at a time. If no size is provided to the reader, we will maintain a recv window of 2^32 - 1 bytes, the maximum allowed by the protocol, allowing the client to send unlimited amounts of data.

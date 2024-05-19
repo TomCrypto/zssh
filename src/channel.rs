@@ -88,26 +88,12 @@ impl<'a, 'b, T: Behavior> Channel<'a, 'b, T> {
 
     /// Convenience method that writes all bytes into standard output.
     pub async fn write_all_stdout(&mut self, bytes: &[u8]) -> Result<(), TransportError<T>> {
-        self.write_all(Pipe::Stdout, bytes).await
+        self.stdout().write_all_internal(bytes).await
     }
 
     /// Convenience method that writes all bytes into standard error.
     pub async fn write_all_stderr(&mut self, bytes: &[u8]) -> Result<(), TransportError<T>> {
-        self.write_all(Pipe::Stderr, bytes).await
-    }
-
-    async fn write_all(&mut self, pipe: Pipe, bytes: &[u8]) -> Result<(), TransportError<T>> {
-        for chunk in bytes.chunks(self.payload_buffer_len(pipe)) {
-            let mut writer = Writer::new(self.transport, pipe);
-            writer.buffer()[..chunk.len()].copy_from_slice(chunk);
-            writer.write_all(chunk.len()).await?;
-        }
-
-        Ok(())
-    }
-
-    fn payload_buffer_len(&mut self, pipe: Pipe) -> usize {
-        self.writer(pipe).buffer().len()
+        self.stderr().write_all_internal(bytes).await
     }
 }
 
@@ -146,16 +132,25 @@ impl<'a, 'b, T: Behavior> Writer<'a, 'b, T> {
         Self { transport, pipe }
     }
 
-    /// A byte slice into the packet buffer.
+    /// Returns a byte slice into the packet buffer.
     pub fn buffer(&mut self) -> &mut [u8] {
         self.transport.channel_data_payload_buffer(self.pipe)
     }
 
-    /// Writes all submitted bytes present in the packet buffer.
+    /// Writes all requested bytes already present in the packet buffer.
     ///
     /// This will take the first `len` bytes in the byte slice returned
     /// by the `buffer()` method and send them as a single SSH message.
     pub async fn write_all(self, len: usize) -> Result<(), TransportError<T>> {
         self.transport.channel_write(len, self.pipe).await
+    }
+
+    async fn write_all_internal(mut self, bytes: &[u8]) -> Result<(), TransportError<T>> {
+        for chunk in bytes.chunks(self.buffer().len()) {
+            self.buffer()[..chunk.len()].copy_from_slice(chunk);
+            self.transport.channel_write(chunk.len(), self.pipe).await?;
+        }
+
+        Ok(())
     }
 }

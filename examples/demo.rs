@@ -128,7 +128,7 @@ async fn handle_client(stream: TcpStream) -> Result<(), TransportError<ExampleBe
                 // This shows how you need to buffer yourself if you need to interleave
                 // reads and writes to the channel because the packet buffer is shared.
 
-                let mut buffer = [0u8; 512];
+                let mut buffer = [0u8; 4096];
 
                 loop {
                     let read_len = channel.read_exact_stdin(&mut buffer).await?;
