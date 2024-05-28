@@ -142,14 +142,24 @@ impl<'a, 'b, T: Behavior> Writer<'a, 'b, T> {
     /// This will take the first `len` bytes in the byte slice returned
     /// by the `buffer()` method and send them as a single SSH message.
     pub async fn write_all(self, len: usize) -> Result<(), TransportError<T>> {
-        self.transport.channel_write(len, self.pipe).await
+        self.transport.channel_write_all(len, self.pipe).await?;
+
+        // TODO: report to the caller whether we wrote all bytes (the only
+        // case where we don't is if the client closed the channel on us).
+
+        Ok(())
     }
 
     async fn write_all_internal(mut self, bytes: &[u8]) -> Result<(), TransportError<T>> {
         for chunk in bytes.chunks(self.buffer().len()) {
             self.buffer()[..chunk.len()].copy_from_slice(chunk);
-            self.transport.channel_write(chunk.len(), self.pipe).await?;
+            self.transport
+                .channel_write_all(chunk.len(), self.pipe)
+                .await?;
         }
+
+        // TODO: report to the caller whether we wrote all bytes (the only
+        // case where we don't is if the client closed the channel on us).
 
         Ok(())
     }

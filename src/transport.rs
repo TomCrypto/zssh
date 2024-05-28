@@ -370,47 +370,64 @@ impl<'a, T: Behavior> Transport<'a, T> {
         Ok(())
     }
 
+    pub(crate) async fn channel_write_all(
+        &mut self,
+        len: usize,
+        pipe: Pipe,
+    ) -> Result<bool, TransportError<T>> {
+        while !self.channel_write(len, pipe).await? {
+            if let HalfState::Close = self.channel_state().tx_half {
+                return Ok(false); // client has closed the channel
+            }
+
+            self.poll_client().await?;
+        }
+
+        Ok(true)
+    }
+
     pub(crate) async fn channel_write(
         &mut self,
         len: usize,
         pipe: Pipe,
-    ) -> Result<(), TransportError<T>> {
-        match self.channel_state().tx_half {
-            HalfState::Window(amount) => {
-                if wire::from_u32(amount) >= len {
-                    let recipient_channel = self.channel_state().tx_channel_id;
+    ) -> Result<bool, TransportError<T>> {
+        assert!(len <= self.channel_data_payload_buffer(pipe).len());
 
-                    self.send(match pipe {
-                        Pipe::Stdout => wire::Message::ChannelData {
-                            recipient_channel,
+        if len == 0 {
+            return Ok(true);
+        }
+
+        if let HalfState::Window(amount) = self.channel_state().tx_half {
+            if wire::from_u32(amount) >= len {
+                let recipient_channel = self.channel_state().tx_channel_id;
+
+                self.send(match pipe {
+                    Pipe::Stdout => wire::Message::ChannelData {
+                        recipient_channel,
+                        data: wire::Data::InPlace {
+                            len: wire::into_u32(len),
+                        },
+                    },
+                    Pipe::Stderr => wire::Message::ChannelExtendedData {
+                        recipient_channel,
+                        data: wire::ExtendedData::Stderr {
                             data: wire::Data::InPlace {
                                 len: wire::into_u32(len),
                             },
                         },
-                        Pipe::Stderr => wire::Message::ChannelExtendedData {
-                            recipient_channel,
-                            data: wire::ExtendedData::Stderr {
-                                data: wire::Data::InPlace {
-                                    len: wire::into_u32(len),
-                                },
-                            },
-                        },
-                    })
-                    .await?;
+                    },
+                })
+                .await?;
 
-                    self.channel_state()
-                        .tx_half
-                        .decrease_window(wire::into_u32(len))?;
-                } else {
-                    self.poll_client().await?;
-                }
-            }
-            HalfState::Eof | HalfState::Close => {
-                unreachable!("channel tx half should not be eof or close");
+                self.channel_state()
+                    .tx_half
+                    .decrease_window(wire::into_u32(len))?;
+
+                return Ok(true);
             }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     async fn poll_client(&mut self) -> Result<Option<usize>, TransportError<T>> {
@@ -957,6 +974,8 @@ impl<'a, T: Behavior> Transport<'a, T> {
                             .await?;
 
                             self.dequeue_pending_channel().await?;
+                        } else {
+                            channel_state.tx_half = HalfState::Close;
                         }
 
                         return Ok(None);
