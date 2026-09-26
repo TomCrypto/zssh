@@ -58,6 +58,10 @@ impl<'a, 'b, T: Behavior> Channel<'a, 'b, T> {
         &mut self,
         mut bytes: &mut [u8],
     ) -> Result<usize, TransportError<T>> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+
         let read_len = bytes.len();
 
         let mut reader = self.reader(Some(read_len)).await?;
@@ -72,28 +76,46 @@ impl<'a, 'b, T: Behavior> Channel<'a, 'b, T> {
     }
 
     /// Obtains a writer over this channel for the specified pipe.
-    pub fn writer(&mut self, pipe: Pipe) -> Writer<'a, '_, T> {
-        Writer::new(self.transport, pipe)
+    pub async fn writer(
+        &mut self,
+        pipe: Pipe,
+        capacity: usize,
+    ) -> Result<Writer<'a, '_, T>, TransportError<T>> {
+        let writer = Writer::new(self.transport, pipe, capacity);
+        let capacity = writer.capacity; // might have decreased!
+        writer.transport.channel_write_window(capacity).await?;
+
+        Ok(writer)
     }
 
     /// Obtains a writer over this channel for standard output.
-    pub fn stdout(&mut self) -> Writer<'a, '_, T> {
-        self.writer(Pipe::Stdout)
+    pub async fn stdout(
+        &mut self,
+        capacity: usize,
+    ) -> Result<Writer<'a, '_, T>, TransportError<T>> {
+        self.writer(Pipe::Stdout, capacity).await
     }
 
     /// Obtains a writer over this channel for standard error.
-    pub fn stderr(&mut self) -> Writer<'a, '_, T> {
-        self.writer(Pipe::Stderr)
+    pub async fn stderr(
+        &mut self,
+        capacity: usize,
+    ) -> Result<Writer<'a, '_, T>, TransportError<T>> {
+        self.writer(Pipe::Stderr, capacity).await
     }
 
     /// Convenience method that writes all bytes into standard output.
     pub async fn write_all_stdout(&mut self, bytes: &[u8]) -> Result<(), TransportError<T>> {
-        self.stdout().write_all_internal(bytes).await
+        Writer::new(self.transport, Pipe::Stdout, bytes.len())
+            .write_all_internal(bytes)
+            .await
     }
 
     /// Convenience method that writes all bytes into standard error.
     pub async fn write_all_stderr(&mut self, bytes: &[u8]) -> Result<(), TransportError<T>> {
-        self.stderr().write_all_internal(bytes).await
+        Writer::new(self.transport, Pipe::Stderr, bytes.len())
+            .write_all_internal(bytes)
+            .await
     }
 }
 
@@ -124,17 +146,24 @@ impl<'a, 'b, T: Behavior> Reader<'a, 'b, T> {
 /// Writer associated with an SSH channel.
 pub struct Writer<'a, 'b, T: Behavior> {
     transport: &'b mut Transport<'a, T>,
+    capacity: usize,
     pipe: Pipe,
 }
 
 impl<'a, 'b, T: Behavior> Writer<'a, 'b, T> {
-    fn new(transport: &'b mut Transport<'a, T>, pipe: Pipe) -> Self {
-        Self { transport, pipe }
+    fn new(transport: &'b mut Transport<'a, T>, pipe: Pipe, capacity: usize) -> Self {
+        let capacity = capacity.min(transport.channel_data_payload_buffer(pipe).len());
+
+        Self {
+            transport,
+            capacity,
+            pipe,
+        }
     }
 
     /// Returns a byte slice into the packet buffer.
     pub fn buffer(&mut self) -> &mut [u8] {
-        self.transport.channel_data_payload_buffer(self.pipe)
+        &mut self.transport.channel_data_payload_buffer(self.pipe)[..self.capacity]
     }
 
     /// Writes all requested bytes already present in the packet buffer.
@@ -142,24 +171,28 @@ impl<'a, 'b, T: Behavior> Writer<'a, 'b, T> {
     /// This will take the first `len` bytes in the byte slice returned
     /// by the `buffer()` method and send them as a single SSH message.
     pub async fn write_all(self, len: usize) -> Result<(), TransportError<T>> {
+        assert!(len <= self.capacity, "write exceeds capacity");
         self.transport.channel_write_all(len, self.pipe).await?;
-
-        // TODO: report to the caller whether we wrote all bytes (the only
-        // case where we don't is if the client closed the channel on us).
 
         Ok(())
     }
 
     async fn write_all_internal(mut self, bytes: &[u8]) -> Result<(), TransportError<T>> {
-        for chunk in bytes.chunks(self.buffer().len()) {
-            self.buffer()[..chunk.len()].copy_from_slice(chunk);
-            self.transport
-                .channel_write_all(chunk.len(), self.pipe)
-                .await?;
+        if bytes.is_empty() {
+            return Ok(());
         }
 
-        // TODO: report to the caller whether we wrote all bytes (the only
-        // case where we don't is if the client closed the channel on us).
+        for mut chunk in bytes.chunks(self.buffer().len()) {
+            while !chunk.is_empty() {
+                let window = self.transport.channel_write_window(1).await?;
+
+                let len = chunk.len().min(window);
+                self.buffer()[..len].copy_from_slice(&chunk[..len]);
+
+                self.transport.channel_write_all(len, self.pipe).await?;
+                chunk = &chunk[len..]; // write as many bytes as we can
+            }
+        }
 
         Ok(())
     }

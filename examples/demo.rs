@@ -1,5 +1,5 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::{rngs::ThreadRng, thread_rng};
+use rand::{rng, rngs::ThreadRng};
 use sha2::{Digest, Sha256};
 
 use zssh::{AuthMethod, Behavior, PublicKey, Request, SecretKey, Transport, TransportError};
@@ -80,7 +80,7 @@ const USER_PUBLIC_KEY: [u8; 32] = [
 async fn handle_client(stream: TcpStream) -> Result<(), TransportError<ExampleBehavior>> {
     let behavior = ExampleBehavior {
         stream: AsyncTcpStream(stream),
-        random: thread_rng(),
+        random: rng(),
         host_secret_key: SecretKey::Ed25519 {
             secret_key: SigningKey::from_bytes(&HOST_SECRET_KEY),
         },
@@ -171,9 +171,9 @@ async fn handle_client(stream: TcpStream) -> Result<(), TransportError<ExampleBe
                 // packet buffer as a `&mut [u8]`, write to it via `writeln!`, then
                 // tell the transport to send as much of the buffer as was written.
 
-                let mut writer = channel.stdout();
-                let mut buffer = writer.buffer();
+                let mut writer = channel.stdout(32).await?;
 
+                let mut buffer = writer.buffer();
                 let bytes_available = buffer.len();
 
                 // NOTE: there's an assumption here that the write fits in the packet
@@ -219,34 +219,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // ======= UNIMPORTANT CODE IMPLEMENTING EMBEDDED-IO-ASYNC TRAITS =======
 // ======================================================================
 
-use embedded_io_async::{Error, ErrorKind, ErrorType, Read, Write};
+use embedded_io_async::{ErrorType, Read, Write};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Debug)]
 struct AsyncTcpStream(TcpStream);
 
-#[derive(Debug)]
-struct TokioError(tokio::io::Error);
-
-impl Error for TokioError {
-    fn kind(&self) -> ErrorKind {
-        self.0.kind().into()
-    }
-}
-
 impl ErrorType for AsyncTcpStream {
-    type Error = TokioError;
+    type Error = tokio::io::Error;
 }
 
 impl Read for AsyncTcpStream {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        self.0.read(buf).await.map_err(TokioError)
+        self.0.read(buf).await
     }
 }
 
 impl Write for AsyncTcpStream {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        self.0.write(buf).await.map_err(TokioError)
+        self.0.write(buf).await
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        self.0.flush().await
     }
 }

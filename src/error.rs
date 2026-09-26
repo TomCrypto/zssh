@@ -34,6 +34,8 @@ impl From<core::str::Utf8Error> for ProtocolError {
 pub enum Error<E> {
     /// The transport's stream reached EOF unexpectedly.
     UnexpectedEof,
+    /// The channel was closed before a write completed.
+    ChannelClosed,
     /// The transport's stream encountered an I/O error.
     IO(E),
     /// The transport encountered a fatal protocol error.

@@ -4,14 +4,14 @@ use crate::error::{Error, ProtocolError};
 use crate::types::{self, AuthMethod, Behavior, Request, SecretKey, TransportError};
 use crate::wire;
 
-use chacha20::cipher::{KeyInit, KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20Legacy;
+use chacha20::cipher::{KeyInit, KeyIvInit, StreamCipher, StreamCipherSeek};
 use constant_time_eq::constant_time_eq;
 use core::ops::Range;
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use embedded_io_async::{Read, Write};
 use poly1305::Poly1305;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
@@ -161,6 +161,8 @@ impl<'a, T: Behavior> Transport<'a, T> {
         self.behavior.stream().write_all(ssh_str).await?;
         self.behavior.stream().write_all(b"\r\n").await?;
 
+        self.behavior.stream().flush().await?;
+
         // The client is not allowed to send arbitrary lines prior to sending its
         // identification string (the server can, but we don't). The parser below
         // checks that the input is well-formed according to RFC4253 section 4.2.
@@ -168,7 +170,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
         for i in 0..255 {
             self.behavior
                 .stream()
-                .read(&mut self.client_ssh_id_buffer[i..i + 1])
+                .read_exact(&mut self.client_ssh_id_buffer[i..i + 1])
                 .await?;
 
             let curr = self.client_ssh_id_buffer[i];
@@ -189,7 +191,13 @@ impl<'a, T: Behavior> Transport<'a, T> {
             }
         }
 
-        if !self.client_ssh_id_string().starts_with("SSH-2.0-") {
+        let identification = self.client_ssh_id_string();
+
+        if !identification.starts_with("SSH-2.0-") {
+            Err(ProtocolError::BadIdentificationString)?;
+        }
+
+        if identification.contains(['\r', '\n']) {
             Err(ProtocolError::BadIdentificationString)?;
         }
 
@@ -240,7 +248,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
         }
     }
 
-    fn maximum_channel_data_packet_size(&mut self) -> u32 {
+    fn maximum_channel_data_packet_size(&self) -> u32 {
         let range = self.payload_range_full();
 
         // The same principle applies to "stdin" ChannelData messages, we can compute the
@@ -295,9 +303,6 @@ impl<'a, T: Behavior> Transport<'a, T> {
     pub(crate) async fn channel_read(&mut self) -> Result<Option<&[u8]>, TransportError<T>> {
         loop {
             match self.channel_state().rx_half {
-                HalfState::Window(0) => {
-                    return Ok(None);
-                }
                 HalfState::Window(amount) => {
                     if self.channel_state().rx_committed {
                         // Only re-adjust the window if it is smaller than the maximum data size, this
@@ -316,6 +321,8 @@ impl<'a, T: Behavior> Transport<'a, T> {
 
                             self.channel_state().rx_half.increase_window(bytes_to_add)?;
                         }
+                    } else if amount == 0 {
+                        return Ok(None);
                     }
 
                     if let Some(payload_len) = self.poll_client().await? {
@@ -370,20 +377,31 @@ impl<'a, T: Behavior> Transport<'a, T> {
         Ok(())
     }
 
+    pub(crate) async fn channel_write_window(
+        &mut self,
+        capacity: usize,
+    ) -> Result<usize, TransportError<T>> {
+        loop {
+            match self.channel_state().tx_half {
+                HalfState::Window(amount) if wire::from_u32(amount) < capacity => {
+                    self.poll_client().await?;
+                }
+                HalfState::Window(amount) => return Ok(wire::from_u32(amount)),
+                HalfState::Eof | HalfState::Close => return Err(Error::ChannelClosed),
+            }
+        }
+    }
+
     pub(crate) async fn channel_write_all(
         &mut self,
         len: usize,
         pipe: Pipe,
-    ) -> Result<bool, TransportError<T>> {
-        while !self.channel_write(len, pipe).await? {
-            if let HalfState::Close = self.channel_state().tx_half {
-                return Ok(false); // client has closed the channel
-            }
-
-            self.poll_client().await?;
+    ) -> Result<(), TransportError<T>> {
+        if !self.channel_write(len, pipe).await? {
+            return Err(Error::ChannelClosed);
         }
 
-        Ok(true)
+        Ok(())
     }
 
     pub(crate) async fn channel_write(
@@ -435,10 +453,31 @@ impl<'a, T: Behavior> Transport<'a, T> {
             self.perform_handshake().await?;
         }
 
+        let payload_len = self.recv().await?;
+
+        let payload = &self.buffer[self.payload_range(payload_len)];
         let mut reason = wire::DisconnectReason::ProtocolError;
 
-        let payload_len = self.recv().await?; // we sometimes need the message payload bytes
-        let message = wire::Message::decode(&self.buffer[self.payload_range(payload_len)])?;
+        if let Some(kex) = &mut self.kex {
+            if kex.discard_guessed && matches!(payload, [30..=49, ..]) {
+                kex.discard_guessed = false;
+                return Ok(None);
+            }
+        }
+
+        if self.authenticated && matches!(payload, [50..=79, ..]) {
+            return Ok(None); // user is already authenticated
+        }
+
+        let message = wire::Message::decode(payload)?;
+
+        if (self.kex.is_some() || self.next_keys.is_some())
+            && matches!(payload, [5 | 6 | 50..=255, ..])
+            && !matches!(message, wire::Message::Unknown { .. })
+        {
+            self.send(wire::Message::Disconnect { reason }).await?;
+            return Err(Error::ServerDisconnect(reason));
+        }
 
         match message {
             wire::Message::KexInit {
@@ -450,7 +489,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
                 compression_algorithms_server_to_client,
                 first_kex_packet_follows,
                 ..
-            } if self.kex.is_none() => {
+            } if self.kex.is_none() && self.next_keys.is_none() => {
                 if self.curr_keys.is_none()
                     && kex_algorithms.find(KEXINIT_STRICT_KEX_CLIENT).is_some()
                 {
@@ -586,10 +625,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
                 client_ephemeral_public_key,
             } => {
                 if let Some(mut kex) = self.kex.take() {
-                    if core::mem::replace(&mut kex.discard_guessed, false) {
-                        self.kex = Some(kex);
-                        return Ok(None);
-                    } else if let Ok(client_ephemeral_public_key) =
+                    if let Ok(client_ephemeral_public_key) =
                         <&[u8] as TryInto<[u8; 32]>>::try_into(client_ephemeral_public_key)
                     {
                         let client_ephemeral_public_key: PublicKey =
@@ -605,6 +641,13 @@ impl<'a, T: Behavior> Transport<'a, T> {
 
                         let shared_secret = server_ephemeral_secret_key
                             .diffie_hellman(&client_ephemeral_public_key);
+
+                        if !shared_secret.was_contributory() {
+                            let reason = wire::DisconnectReason::KeyExchangeFailed;
+                            self.send(wire::Message::Disconnect { reason }).await?;
+
+                            return Err(Error::ServerDisconnect(reason));
+                        }
 
                         // Finish building up the exchange hash
 
@@ -865,16 +908,27 @@ impl<'a, T: Behavior> Transport<'a, T> {
                         maximum_packet_size,
                     },
             } if self.authenticated => {
-                for channel in self.channels.into_iter().flatten() {
-                    if channel.sender_channel == sender_channel {
-                        self.send(wire::Message::Disconnect {
-                            reason: wire::DisconnectReason::ProtocolError,
-                        })
-                        .await?;
-                        return Err(Error::ServerDisconnect(
-                            wire::DisconnectReason::ProtocolError,
-                        ));
-                    }
+                if maximum_packet_size == 0 {
+                    Err(ProtocolError::MalformedPacket)?;
+                }
+
+                let mut duplicate = matches!(
+                    &self.active_channel,
+                    Some(channel) if channel.tx_channel_id == sender_channel
+                );
+
+                for channel in self.channels.iter().flatten() {
+                    duplicate |= channel.sender_channel == sender_channel;
+                }
+
+                if duplicate {
+                    self.send(wire::Message::Disconnect {
+                        reason: wire::DisconnectReason::ProtocolError,
+                    })
+                    .await?;
+                    return Err(Error::ServerDisconnect(
+                        wire::DisconnectReason::ProtocolError,
+                    ));
                 }
 
                 for channel in &mut self.channels {
@@ -930,12 +984,14 @@ impl<'a, T: Behavior> Transport<'a, T> {
                 recipient_channel,
                 data: wire::Data::Borrowed { bytes },
             } if self.authenticated => {
-                if let Some(channel_state) = &mut self.active_channel {
-                    if channel_state.rx_channel_id == recipient_channel {
-                        channel_state
-                            .rx_half
-                            .decrease_window(wire::into_u32(bytes.len()))?;
-                        return Ok(Some(payload_len));
+                if bytes.len() <= wire::from_u32(self.maximum_channel_data_packet_size()) {
+                    if let Some(channel_state) = &mut self.active_channel {
+                        if channel_state.rx_channel_id == recipient_channel {
+                            channel_state
+                                .rx_half
+                                .decrease_window(wire::into_u32(bytes.len()))?;
+                            return Ok(Some(payload_len));
+                        }
                     }
                 }
             }
@@ -992,7 +1048,9 @@ impl<'a, T: Behavior> Transport<'a, T> {
                     },
             } if self.authenticated && self.request.is_none() => {
                 if let Some(channel_state) = &mut self.active_channel {
-                    if channel_state.rx_channel_id == recipient_channel {
+                    if channel_state.rx_channel_id == recipient_channel
+                        && matches!(channel_state.tx_half, HalfState::Window(_))
+                    {
                         self.request = Some(Request::Exec(self.behavior.parse_command(command)));
 
                         if want_reply {
@@ -1018,7 +1076,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
                         if want_reply {
                             let sender_channel = channel_state.tx_channel_id;
 
-                            self.send(wire::Message::ChannelSuccess {
+                            self.send(wire::Message::ChannelFailure {
                                 recipient_channel: sender_channel,
                             })
                             .await?;
@@ -1034,7 +1092,9 @@ impl<'a, T: Behavior> Transport<'a, T> {
                 request: wire::Request::Shell { want_reply },
             } if self.authenticated && self.request.is_none() && self.behavior.allow_shell() => {
                 if let Some(channel_state) = &mut self.active_channel {
-                    if channel_state.rx_channel_id == recipient_channel {
+                    if channel_state.rx_channel_id == recipient_channel
+                        && matches!(channel_state.tx_half, HalfState::Window(_))
+                    {
                         self.request = Some(Request::Shell);
 
                         if want_reply {
@@ -1082,7 +1142,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
 
                 return Ok(None);
             }
-            wire::Message::Unknown { .. } => {
+            wire::Message::Unknown { message, .. } if self.authenticated || message < 80 => {
                 if self.strict_kex && self.curr_keys.is_none() {
                     return Err(Error::ServerDisconnect(
                         wire::DisconnectReason::ProtocolError,
@@ -1111,6 +1171,12 @@ impl<'a, T: Behavior> Transport<'a, T> {
         &mut self,
         payload_len: usize,
     ) -> Result<(), TransportError<T>> {
+        if self.server_sequence_number == u32::MAX - 1 {
+            return Err(Error::ServerDisconnect(
+                wire::DisconnectReason::ByApplication,
+            ));
+        }
+
         self.server_sequence_number = self.server_sequence_number.wrapping_add(1);
 
         // NOTE: padding rules differ for AEAD cipher modes
@@ -1174,6 +1240,8 @@ impl<'a, T: Behavior> Transport<'a, T> {
                 .await?;
         }
 
+        self.behavior.stream().flush().await?;
+
         Ok(())
     }
 
@@ -1185,6 +1253,12 @@ impl<'a, T: Behavior> Transport<'a, T> {
     }
 
     async fn recv(&mut self) -> Result<usize, TransportError<T>> {
+        if self.client_sequence_number == u32::MAX - 1 {
+            return Err(Error::ServerDisconnect(
+                wire::DisconnectReason::ByApplication,
+            ));
+        }
+
         self.client_sequence_number = self.client_sequence_number.wrapping_add(1);
 
         self.behavior
@@ -1220,7 +1294,7 @@ impl<'a, T: Behavior> Transport<'a, T> {
 
         let mac_len = if self.curr_keys.is_some() { 16 } else { 0 };
 
-        if 4 + packet_len + mac_len > self.buffer.len() {
+        if packet_len > self.buffer.len() - 4 - mac_len {
             Err(ProtocolError::BufferExhausted)?;
         }
 
@@ -1303,6 +1377,8 @@ impl<'a, T: Behavior> Transport<'a, T> {
                     payload: &[],
                 })
                 .await?;
+
+                self.channels.rotate_left(1);
 
                 break;
             }

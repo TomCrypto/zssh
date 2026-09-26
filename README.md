@@ -68,8 +68,9 @@ The API offers a zero-copy feature in the form of `Channel::writer` which allows
 
 However, please note that:
 
- - the `Writer::write_all` method consumes the writer, this is by design as once the data is ready to be sent, it is encrypted in-place by the transport; this is to avoid an API footgun and has no performance implications since `Channel::writer` does no work;
- - as a corollary to the previous point, callers must assume that `Writer::buffer` contains garbage, it is **not** zeroed out by the crate!
+ - the requested capacity is still bounded by the available packet buffer size and the client's maximum packet size, so the slice returned by `Writer::buffer` may not be the same length as the requested capacity;
+ - the client is under no obligation to advertise a sufficient window size for your write (it may even advertise a zero window size, effectively forbidding the server from writing) so progress is not guaranteed;
+ - you must not assume anything about the initial contents of the slice returned by `Writer::buffer` as it will likely contain encrypted payload bytes from previous writes and does not get zeroed automatically.
 
 ## Performance
 

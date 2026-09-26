@@ -436,7 +436,7 @@ impl<'a> AuthMethod<'a> {
                 payload,
             } => {
                 writer.write_string_utf8(method_name)?;
-                writer.write_string(payload)?;
+                writer.write_byte_array(payload)?;
             }
             AuthMethod::None => {
                 writer.write_string_utf8("none")?;
@@ -491,7 +491,7 @@ impl<'a> PublicKey<'a> {
                     payload,
                 } => {
                     writer.write_string_utf8(identifier)?;
-                    writer.write_string(payload)?;
+                    writer.write_byte_array(payload)?;
                 }
             }
 
@@ -544,7 +544,7 @@ impl<'a> Signature<'a> {
                     payload,
                 } => {
                     writer.write_string_utf8(identifier)?;
-                    writer.write_string(payload)?;
+                    writer.write_byte_array(payload)?;
                 }
             }
 
@@ -564,11 +564,7 @@ impl<'a> NameList<'a> {
             return Err(ProtocolError::BadStringEncoding);
         }
 
-        if string
-            .as_bytes()
-            .windows(2)
-            .any(|window| window == [b','; 2])
-        {
+        if !string.is_empty() && string.split(',').any(str::is_empty) {
             Err(ProtocolError::BadNameList)
         } else {
             Ok(Self { string })
@@ -580,7 +576,7 @@ impl<'a> NameList<'a> {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &str> {
-        self.string.split(',')
+        self.string.split_terminator(',')
     }
 
     pub fn as_str(&self) -> &'a str {
@@ -1025,7 +1021,7 @@ impl<'a> Message<'a> {
                 service_name,
                 auth_method,
             } => {
-                writer.write_byte(MSG_USERAUTH_SUCCESS)?;
+                writer.write_byte(MSG_USERAUTH_REQUEST)?;
                 writer.write_string_utf8(user_name)?;
                 writer.write_string_utf8(service_name)?;
                 auth_method.encode_with(&mut writer)?;
@@ -1062,11 +1058,11 @@ impl<'a> Message<'a> {
                 writer.write_byte(MSG_GLOBAL_REQUEST)?;
                 writer.write_string_utf8(request_name)?;
                 writer.write_boolean(want_reply)?;
-                writer.write_string(payload)?;
+                writer.write_byte_array(payload)?;
             }
             Self::RequestSuccess { payload } => {
                 writer.write_byte(MSG_REQUEST_SUCCESS)?;
-                writer.write_string(payload)?;
+                writer.write_byte_array(payload)?;
             }
             Self::RequestFailure => {
                 writer.write_byte(MSG_REQUEST_FAILURE)?;

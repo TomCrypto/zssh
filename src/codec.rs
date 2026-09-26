@@ -1,8 +1,8 @@
 use crate::error::ProtocolError;
-use crate::wire::{from_u32, into_u32, NameList};
+use crate::wire::{NameList, from_u32, into_u32};
 
 use core::str::from_utf8;
-use sha2::{digest::Output, Digest};
+use sha2::{Digest, digest::Output};
 
 #[derive(Debug)]
 pub struct ObjectWriter<'a> {
@@ -225,16 +225,14 @@ impl<H: Digest> ObjectHasher<H> {
     }
 
     pub fn hash_mpint(&mut self, value: &[u8]) {
-        if value.is_empty() {
-            self.hash_uint32(0);
-        } else if value[0] & 0x80 != 0 {
+        let value = &value[value.iter().position(|&b| b != 0).unwrap_or(value.len())..];
+
+        if value.first().is_some_and(|byte| byte & 0x80 != 0) {
             self.hash_uint32(into_u32(1 + value.len()));
             self.hash_byte(0x00);
             self.hash_byte_array(value);
         } else {
-            let offset = value.iter().position(|&b| b != 0).unwrap_or(0);
-            self.hash_uint32(into_u32(value.len() - offset));
-            self.hash_byte_array(&value[offset..]);
+            self.hash_string(value);
         }
     }
 
